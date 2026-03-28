@@ -11,7 +11,6 @@ pub trait CommandOutput: Sync {
 }
 
 pub trait HistoryRecordOutput: Sync {
-    fn render_csv_row(&self) -> String;
     fn render_json_value(&self) -> Value;
 }
 
