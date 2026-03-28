@@ -34,6 +34,7 @@ pub enum StreamFormat {
     Text,
     Jsonl,
     Csv,
+    Prometheus,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -42,6 +43,7 @@ pub enum HistoryFormat {
     Json,
     Jsonl,
     Csv,
+    Prometheus,
 }
 
 #[derive(Args, Debug)]
