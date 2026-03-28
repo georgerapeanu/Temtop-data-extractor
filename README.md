@@ -1,5 +1,9 @@
 # temtop-sensor
 
+Disclaimer
+------------
+This is 100% vibecoded.
+
 Minimal Rust CLI for Temtop BLE sensors, starting with the `C1+`.
 
 Current capabilities:
@@ -16,19 +20,7 @@ This project is deliberately structured to be extended with support for addition
 ## Why this repo exists
 
 The immediate goal is reliable local BLE access to Temtop sensors.
-
-The eventual goal is to feed measurements into a local observability stack, currently based on:
-
-- VictoriaMetrics on `127.0.0.1:8428`
-- Grafana on top of VictoriaMetrics
-
-That integration is intentionally deferred for now. The CLI is written so it can later grow:
-
-- a `--format json` or `--format jsonl` pipeline into a sidecar
-- a Prometheus text exporter mode
-- a direct VictoriaMetrics or `vmagent` push mode
-
-The CLI already supports the discovery patterns needed for that later integration:
+The CLI already supports the discovery patterns. 
 
 - infer GUIDs and sensor model from advertising names when scanning
 - resolve a device by MAC address, GUID, or both
