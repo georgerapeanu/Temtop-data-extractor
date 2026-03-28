@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use btleplug::api::{
-    Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter,
+    ValueNotification, WriteType,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::StreamExt;
@@ -137,6 +138,7 @@ pub async fn connect_and_find_chars(
         .discover_services()
         .await
         .context("failed to discover services")?;
+    disable_all_notifications(peripheral).await;
     let chars = peripheral.characteristics();
     let write_char = chars
         .iter()
@@ -151,6 +153,16 @@ pub async fn connect_and_find_chars(
     Ok((write_char, notify_char))
 }
 
+pub async fn disable_all_notifications(peripheral: &Peripheral) {
+    for characteristic in peripheral.characteristics() {
+        if characteristic.properties.contains(CharPropFlags::NOTIFY)
+            || characteristic.properties.contains(CharPropFlags::INDICATE)
+        {
+            let _ = peripheral.unsubscribe(&characteristic).await;
+        }
+    }
+}
+
 pub async fn wait_for_command(
     notifications: &mut (impl futures::Stream<Item = ValueNotification> + Unpin),
     cmd: u8,
@@ -158,10 +170,19 @@ pub async fn wait_for_command(
     timeout_secs: u64,
     verbose: bool,
 ) -> Result<Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut seen_other_cmds = Vec::new();
     loop {
-        let next = timeout(Duration::from_secs(timeout_secs), notifications.next())
-            .await
-            .map_err(|_| anyhow!("timeout waiting for response 0x{cmd:02x}"))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error(cmd, &seen_other_cmds));
+        }
+        let next = timeout(remaining, notifications.next())
+            .await;
+        let next = match next {
+            Ok(next) => next,
+            Err(_) => return Err(timeout_error(cmd, &seen_other_cmds)),
+        };
         let notification = next.ok_or_else(|| anyhow!("notification stream ended"))?;
         let frame = notification.value;
         if verbose {
@@ -169,6 +190,47 @@ pub async fn wait_for_command(
         }
         if response_matches(&frame, cmd, expected_guid)? {
             return Ok(frame);
+        }
+        if verify_response(&frame) {
+            if let Some(seen_cmd) = frame.get(3).copied() {
+                if seen_cmd != cmd && !seen_other_cmds.contains(&seen_cmd) {
+                    seen_other_cmds.push(seen_cmd);
+                }
+            }
+        }
+    }
+}
+
+fn timeout_error(cmd: u8, seen_other_cmds: &[u8]) -> anyhow::Error {
+    if seen_other_cmds.is_empty() {
+        return anyhow!("timeout waiting for response 0x{cmd:02x}");
+    }
+    anyhow!(
+        "timeout waiting for response 0x{cmd:02x}; saw other commands: {}",
+        seen_other_cmds
+            .iter()
+            .map(|seen| format!("0x{seen:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+pub async fn drain_notifications(
+    notifications: &mut (impl futures::Stream<Item = ValueNotification> + Unpin),
+    quiet_ms: u64,
+    verbose: bool,
+) -> Result<usize> {
+    let mut drained = 0usize;
+    loop {
+        match timeout(Duration::from_millis(quiet_ms), notifications.next()).await {
+            Ok(Some(notification)) => {
+                drained += 1;
+                if verbose {
+                    println!("drain  <- {}", format_frame_hex(&notification.value));
+                }
+            }
+            Ok(None) => return Ok(drained),
+            Err(_) => return Ok(drained),
         }
     }
 }
