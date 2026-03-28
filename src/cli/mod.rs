@@ -114,6 +114,8 @@ pub fn resolved_guid(target: &TargetArgs, discovered_guid: Option<String>) -> Re
 
 pub struct ConnectedTarget {
     pub peripheral: Peripheral,
+    pub address: String,
+    pub name: Option<String>,
     pub guid: String,
     pub write_char: Characteristic,
     pub notify_char: Characteristic,
@@ -129,6 +131,8 @@ pub async fn connect_target(target: &TargetArgs, sensor: &str) -> Result<Connect
 
     Ok(ConnectedTarget {
         peripheral,
+        address: discovered.address,
+        name: discovered.name,
         guid,
         write_char,
         notify_char,

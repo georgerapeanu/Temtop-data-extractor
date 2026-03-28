@@ -1,20 +1,24 @@
 use anyhow::{anyhow, bail, Result};
 use btleplug::api::Peripheral as _;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
+use serde_json::json;
 use std::future::Future;
 use std::io::{self, Write};
+use std::time::Instant;
 use tokio::time::{interval, Duration};
 
 use crate::ble::{
     disable_all_notifications, drain_notifications, first_adapter, format_frame_hex, request_once,
     resolve_device, wait_for_command,
 };
+use crate::output::prometheus::{
+    render_collect_metrics, unix_timestamp_ms_now, CollectReport, CollectTelemetry, MetricLabels,
+};
 use crate::protocol::build_request;
 use crate::sensor::c1_plus::C1_PLUS;
 use crate::sensor::SensorProfile;
-use serde_json::json;
 
 use super::{
     connect_target, print_json, print_jsonl, target_filter, HistoryFormat, OutputFormat,
@@ -34,6 +38,12 @@ pub enum C1PlusCommand {
     Current(C1PlusOutputCmd),
     History(C1PlusHistoryCmd),
     Live(C1PlusLiveCmd),
+    Collect(C1PlusCollectCmd),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CollectFormat {
+    Prometheus,
 }
 
 #[derive(Args, Debug)]
@@ -78,6 +88,21 @@ pub struct C1PlusLiveCmd {
     pub limit: Option<usize>,
 }
 
+#[derive(Args, Debug)]
+pub struct C1PlusCollectCmd {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    #[arg(
+        long,
+        help = "Human-friendly sensor name included in metrics labels and logs."
+    )]
+    pub sensor_name: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = CollectFormat::Prometheus)]
+    pub format: CollectFormat,
+}
+
 pub async fn run(cli: C1PlusCli) -> Result<()> {
     match cli.command {
         C1PlusCommand::Inspect(cmd) => inspect(cmd).await,
@@ -85,7 +110,23 @@ pub async fn run(cli: C1PlusCli) -> Result<()> {
         C1PlusCommand::Current(cmd) => current(cmd).await,
         C1PlusCommand::History(cmd) => history(cmd).await,
         C1PlusCommand::Live(cmd) => live(cmd).await,
+        C1PlusCommand::Collect(cmd) => collect(cmd).await,
     }
+}
+
+#[derive(Debug)]
+struct FetchOutcome<T> {
+    value: Option<T>,
+    success: bool,
+    duration_seconds: f64,
+    retries: u64,
+    error: Option<anyhow::Error>,
+}
+
+#[derive(Debug)]
+struct HistoryData {
+    session: serde_json::Value,
+    records: Vec<serde_json::Value>,
 }
 
 async fn disconnect_on_sigint<T, F>(
@@ -213,6 +254,27 @@ fn print_history_output(
     Ok(())
 }
 
+fn log_event(level: &str, event: &str, labels: Option<&MetricLabels>, extra: serde_json::Value) {
+    let mut payload = serde_json::Map::new();
+    payload.insert("level".to_string(), json!(level));
+    payload.insert("event".to_string(), json!(event));
+
+    if let Some(labels) = labels {
+        payload.insert("sensor".to_string(), json!(labels.sensor));
+        payload.insert("guid".to_string(), json!(labels.guid));
+        payload.insert("sensor_name".to_string(), json!(labels.sensor_name));
+        payload.insert("mac".to_string(), json!(labels.mac));
+    }
+
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+
+    eprintln!("{}", serde_json::Value::Object(payload));
+}
+
 async fn fetch_command_output(
     cmd: C1PlusOutputCmd,
     request_cmd: u8,
@@ -334,113 +396,239 @@ async fn current(cmd: C1PlusOutputCmd) -> Result<()> {
     .await
 }
 
-async fn history(cmd: C1PlusHistoryCmd) -> Result<()> {
-    let connected = connect_target(&cmd.target, C1_PLUS.id()).await?;
-    with_disconnect(&connected.peripheral, async {
-        let history_result = disconnect_on_sigint(&connected.peripheral, async {
-            let peripheral = &connected.peripheral;
-            let mut notifications = peripheral.notifications().await?;
-            peripheral.subscribe(&connected.notify_char).await?;
-            let drained = drain_notifications(&mut notifications, 250, cmd.target.verbose).await?;
-            if cmd.target.verbose && drained > 0 {
-                eprintln!("drained {drained} queued notifications before history request");
-            }
+async fn fetch_current_json(
+    connected: &super::ConnectedTarget,
+    target: &TargetArgs,
+) -> FetchOutcome<serde_json::Value> {
+    let started = Instant::now();
+    let frame = match build_request(C1_PLUS.cmd_get_current(), &connected.guid, &[]) {
+        Ok(frame) => frame,
+        Err(err) => {
+            return FetchOutcome {
+                value: None,
+                success: false,
+                duration_seconds: started.elapsed().as_secs_f64(),
+                retries: 0,
+                error: Some(err),
+            };
+        }
+    };
 
-            let meta_req = build_request(C1_PLUS.cmd_get_history_meta(), &connected.guid, &[1])?;
+    match disconnect_on_sigint(
+        &connected.peripheral,
+        request_once(
+            &connected.peripheral,
+            &connected.write_char,
+            &connected.notify_char,
+            &frame,
+            C1_PLUS.cmd_get_current(),
+            &connected.guid,
+            target.timeout_secs,
+            target.verbose,
+        ),
+    )
+    .await
+    {
+        Ok(response) => match C1_PLUS.parse_current(&response) {
+            Ok(sample) => FetchOutcome {
+                value: Some(sample.render_json_value()),
+                success: true,
+                duration_seconds: started.elapsed().as_secs_f64(),
+                retries: 0,
+                error: None,
+            },
+            Err(err) => FetchOutcome {
+                value: None,
+                success: false,
+                duration_seconds: started.elapsed().as_secs_f64(),
+                retries: 0,
+                error: Some(err),
+            },
+        },
+        Err(err) => FetchOutcome {
+            value: None,
+            success: false,
+            duration_seconds: started.elapsed().as_secs_f64(),
+            retries: 0,
+            error: Some(err),
+        },
+    }
+}
+
+async fn fetch_history_json(
+    connected: &super::ConnectedTarget,
+    target: &TargetArgs,
+    labels: &MetricLabels,
+) -> FetchOutcome<HistoryData> {
+    let started = Instant::now();
+    let mut retries = 0u64;
+
+    let result = disconnect_on_sigint(&connected.peripheral, async {
+        let peripheral = &connected.peripheral;
+        let mut notifications = peripheral.notifications().await?;
+        peripheral.subscribe(&connected.notify_char).await?;
+        let drained = drain_notifications(&mut notifications, 250, target.verbose).await?;
+        if target.verbose && drained > 0 {
+            eprintln!("drained {drained} queued notifications before history request");
+        }
+
+        let meta_req = build_request(C1_PLUS.cmd_get_history_meta(), &connected.guid, &[1])?;
+        write_request(peripheral, &connected.write_char, &meta_req, target.verbose).await?;
+        let meta = wait_for_command(
+            &mut notifications,
+            C1_PLUS.cmd_get_history_meta(),
+            &connected.guid,
+            target.timeout_secs,
+            target.verbose,
+        )
+        .await?;
+        let (total_count, record_len) = parse_history_meta(&meta)?;
+        let session_json = json!({
+            "address": peripheral.address().to_string(),
+            "guid": connected.guid.clone(),
+            "sensor": C1_PLUS.id(),
+            "total_count": total_count,
+            "record_len": record_len,
+        });
+
+        let mut records = Vec::new();
+        let mut retries_left = 3i32;
+        while records.len() < total_count as usize {
+            let chunk_req = build_request(C1_PLUS.cmd_get_history_chunk(), &connected.guid, &[1])?;
             write_request(
                 peripheral,
                 &connected.write_char,
-                &meta_req,
-                cmd.target.verbose,
+                &chunk_req,
+                target.verbose,
             )
             .await?;
-            let meta = wait_for_command(
+
+            let chunk = match wait_for_command(
                 &mut notifications,
-                C1_PLUS.cmd_get_history_meta(),
+                C1_PLUS.cmd_get_history_chunk(),
                 &connected.guid,
-                cmd.target.timeout_secs,
-                cmd.target.verbose,
+                target.timeout_secs,
+                target.verbose,
             )
-            .await?;
-            let (total_count, record_len) = parse_history_meta(&meta)?;
-            let session_json = json!({
-                "address": peripheral.address().to_string(),
-                "guid": connected.guid.clone(),
-                "sensor": C1_PLUS.id(),
-                "total_count": total_count,
-                "record_len": record_len,
-            });
-
-            let mut records = Vec::new();
-            let mut retries_left = 3i32;
-            while records.len() < total_count as usize {
-                let chunk_req =
-                    build_request(C1_PLUS.cmd_get_history_chunk(), &connected.guid, &[1])?;
-                write_request(
-                    peripheral,
-                    &connected.write_char,
-                    &chunk_req,
-                    cmd.target.verbose,
-                )
-                .await?;
-
-                let chunk = match wait_for_command(
-                    &mut notifications,
-                    C1_PLUS.cmd_get_history_chunk(),
-                    &connected.guid,
-                    cmd.target.timeout_secs,
-                    cmd.target.verbose,
-                )
-                .await
-                {
-                    Ok(chunk) => {
-                        retries_left = 3;
-                        chunk
-                    }
-                    Err(err) => {
-                        retries_left -= 1;
-                        if retries_left < 0 {
-                            let _ = peripheral.unsubscribe(&connected.notify_char).await;
-                            return Err(err);
-                        }
-                        continue;
-                    }
-                };
-
-                let payload = &chunk[17..chunk.len() - 1];
-                if payload.len() % record_len as usize != 0 {
-                    bail!(
-                        "history payload size {} is not a multiple of record length {}",
-                        payload.len(),
-                        record_len
-                    );
+            .await
+            {
+                Ok(chunk) => {
+                    retries_left = 3;
+                    chunk
                 }
-                let before = records.len();
-                for raw_record in payload.chunks_exact(record_len as usize) {
-                    records.push(C1_PLUS.parse_history_record(raw_record, records.len() + 1)?);
-                    if records.len() >= total_count as usize {
-                        break;
-                    }
-                }
-                if records.len() == before {
+                Err(err) => {
+                    retries += 1;
                     retries_left -= 1;
+                    log_event(
+                        "warn",
+                        "history_chunk_retry",
+                        Some(labels),
+                        json!({
+                            "retries_total": retries,
+                            "retries_left": retries_left.max(0),
+                            "error": err.to_string(),
+                        }),
+                    );
                     if retries_left < 0 {
-                        bail!("history chunk produced no records after multiple retries");
-                    }
-                    if cmd.target.verbose {
-                        eprintln!("history chunk produced no records; retrying");
+                        let _ = peripheral.unsubscribe(&connected.notify_char).await;
+                        return Err(err);
                     }
                     continue;
                 }
+            };
+
+            let payload = &chunk[17..chunk.len() - 1];
+            if payload.len() % record_len as usize != 0 {
+                bail!(
+                    "history payload size {} is not a multiple of record length {}",
+                    payload.len(),
+                    record_len
+                );
             }
+            let before = records.len();
+            for raw_record in payload.chunks_exact(record_len as usize) {
+                records.push(
+                    C1_PLUS
+                        .parse_history_record(raw_record, records.len() + 1)?
+                        .render_json_value(),
+                );
+                if records.len() >= total_count as usize {
+                    break;
+                }
+            }
+            if records.len() == before {
+                retries += 1;
+                retries_left -= 1;
+                log_event(
+                    "warn",
+                    "history_chunk_empty_retry",
+                    Some(labels),
+                    json!({
+                        "retries_total": retries,
+                        "retries_left": retries_left.max(0),
+                    }),
+                );
+                if retries_left < 0 {
+                    bail!("history chunk produced no records after multiple retries");
+                }
+                continue;
+            }
+        }
 
-            let _ = peripheral.unsubscribe(&connected.notify_char).await;
-            Ok((session_json, records))
+        let _ = peripheral.unsubscribe(&connected.notify_char).await;
+        Ok(HistoryData {
+            session: session_json,
+            records,
         })
-        .await;
+    })
+    .await;
 
-        let (session_json, records) = history_result?;
-        print_history_output(cmd.format, session_json, &records)
+    match result {
+        Ok(value) => FetchOutcome {
+            success: true,
+            duration_seconds: started.elapsed().as_secs_f64(),
+            retries,
+            value: Some(value),
+            error: None,
+        },
+        Err(err) => FetchOutcome {
+            success: false,
+            duration_seconds: started.elapsed().as_secs_f64(),
+            retries,
+            value: None,
+            error: Some(err),
+        },
+    }
+}
+
+async fn history(cmd: C1PlusHistoryCmd) -> Result<()> {
+    let connected = connect_target(&cmd.target, C1_PLUS.id()).await?;
+    let labels = MetricLabels {
+        mac: connected.address.clone(),
+        guid: connected.guid.clone(),
+        sensor: C1_PLUS.id().to_string(),
+        sensor_name: connected
+            .name
+            .clone()
+            .unwrap_or_else(|| connected.guid.clone()),
+    };
+
+    with_disconnect(&connected.peripheral, async {
+        let history_result = fetch_history_json(&connected, &cmd.target, &labels).await;
+        let history = history_result.value.ok_or_else(|| {
+            history_result
+                .error
+                .unwrap_or_else(|| anyhow!("history collection failed"))
+        })?;
+        let records: Vec<_> = history
+            .records
+            .iter()
+            .map(|record| {
+                Box::new(JsonHistoryRecord(record.clone()))
+                    as Box<dyn crate::sensor::HistoryRecordOutput>
+            })
+            .collect();
+        print_history_output(cmd.format, history.session, &records)
     })
     .await
 }
@@ -537,4 +725,237 @@ async fn live(cmd: C1PlusLiveCmd) -> Result<()> {
         Ok(())
     })
     .await
+}
+
+async fn collect(cmd: C1PlusCollectCmd) -> Result<()> {
+    let started_unix_ms = unix_timestamp_ms_now();
+    let run_started = Instant::now();
+    let provisional_labels = MetricLabels {
+        mac: cmd
+            .target
+            .address
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        guid: cmd
+            .target
+            .guid
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        sensor: C1_PLUS.id().to_string(),
+        sensor_name: cmd
+            .sensor_name
+            .clone()
+            .or_else(|| cmd.target.guid.clone())
+            .or_else(|| cmd.target.address.clone())
+            .unwrap_or_else(|| "unknown".to_string()),
+    };
+
+    let connected = match connect_target(&cmd.target, C1_PLUS.id()).await {
+        Ok(connected) => connected,
+        Err(err) => {
+            let report = CollectReport {
+                labels: provisional_labels.clone(),
+                current: None,
+                history: Vec::new(),
+                telemetry: CollectTelemetry {
+                    started_unix_ms,
+                    finished_unix_ms: unix_timestamp_ms_now(),
+                    duration_seconds: run_started.elapsed().as_secs_f64(),
+                    current_success: false,
+                    current_duration_seconds: None,
+                    history_success: false,
+                    history_duration_seconds: None,
+                    history_retries_total: 0,
+                    history_records_total: 0,
+                },
+            };
+            log_event(
+                "error",
+                "collect_connect_failed",
+                Some(&provisional_labels),
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+            match cmd.format {
+                CollectFormat::Prometheus => {
+                    print!("{}", render_collect_metrics(&report)?);
+                }
+            }
+            return Err(err);
+        }
+    };
+    let labels = MetricLabels {
+        mac: connected.address.clone(),
+        guid: connected.guid.clone(),
+        sensor: C1_PLUS.id().to_string(),
+        sensor_name: cmd
+            .sensor_name
+            .clone()
+            .or_else(|| connected.name.clone())
+            .unwrap_or_else(|| connected.guid.clone()),
+    };
+
+    log_event(
+        "info",
+        "collect_started",
+        Some(&labels),
+        json!({
+            "command": "c1plus collect",
+        }),
+    );
+
+    let (current, history) = with_disconnect(&connected.peripheral, async {
+        log_event(
+            "info",
+            "collect_phase_started",
+            Some(&labels),
+            json!({ "phase": "current" }),
+        );
+        let current = fetch_current_json(&connected, &cmd.target).await;
+        if let Some(err) = current.error.as_ref() {
+            log_event(
+                "error",
+                "collect_phase_failed",
+                Some(&labels),
+                json!({
+                    "phase": "current",
+                    "duration_seconds": current.duration_seconds,
+                    "error": err.to_string(),
+                }),
+            );
+        } else {
+            log_event(
+                "info",
+                "collect_phase_succeeded",
+                Some(&labels),
+                json!({
+                    "phase": "current",
+                    "duration_seconds": current.duration_seconds,
+                }),
+            );
+        }
+
+        log_event(
+            "info",
+            "collect_phase_started",
+            Some(&labels),
+            json!({ "phase": "history" }),
+        );
+        let history = fetch_history_json(&connected, &cmd.target, &labels).await;
+        if let Some(err) = history.error.as_ref() {
+            log_event(
+                "error",
+                "collect_phase_failed",
+                Some(&labels),
+                json!({
+                    "phase": "history",
+                    "duration_seconds": history.duration_seconds,
+                    "retries_total": history.retries,
+                    "error": err.to_string(),
+                }),
+            );
+        } else {
+            let records_total = history
+                .value
+                .as_ref()
+                .map(|value| value.records.len())
+                .unwrap_or(0);
+            log_event(
+                "info",
+                "collect_phase_succeeded",
+                Some(&labels),
+                json!({
+                    "phase": "history",
+                    "duration_seconds": history.duration_seconds,
+                    "retries_total": history.retries,
+                    "records_total": records_total,
+                }),
+            );
+        }
+
+        Ok((current, history))
+    })
+    .await?;
+
+    let finished_unix_ms = unix_timestamp_ms_now();
+    let report = CollectReport {
+        labels: labels.clone(),
+        current: current.value.clone(),
+        history: history
+            .value
+            .as_ref()
+            .map(|value| value.records.clone())
+            .unwrap_or_default(),
+        telemetry: CollectTelemetry {
+            started_unix_ms,
+            finished_unix_ms,
+            duration_seconds: run_started.elapsed().as_secs_f64(),
+            current_success: current.success,
+            current_duration_seconds: Some(current.duration_seconds),
+            history_success: history.success,
+            history_duration_seconds: Some(history.duration_seconds),
+            history_retries_total: history.retries,
+            history_records_total: history
+                .value
+                .as_ref()
+                .map(|value| value.records.len())
+                .unwrap_or(0),
+        },
+    };
+
+    match cmd.format {
+        CollectFormat::Prometheus => {
+            print!("{}", render_collect_metrics(&report)?);
+        }
+    }
+
+    log_event(
+        if report.telemetry.current_success && report.telemetry.history_success {
+            "info"
+        } else {
+            "error"
+        },
+        "collect_finished",
+        Some(&labels),
+        json!({
+            "success": report.telemetry.current_success && report.telemetry.history_success,
+            "duration_seconds": report.telemetry.duration_seconds,
+            "history_retries_total": report.telemetry.history_retries_total,
+            "history_records_total": report.telemetry.history_records_total,
+            "history_session": history.value.as_ref().map(|value| value.session.clone()),
+        }),
+    );
+
+    if let Some(err) = current.error {
+        bail!(err);
+    }
+    if let Some(err) = history.error {
+        bail!(err);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct JsonHistoryRecord(serde_json::Value);
+
+impl crate::sensor::HistoryRecordOutput for JsonHistoryRecord {
+    fn render_text_row(&self) -> String {
+        self.0.to_string()
+    }
+
+    fn render_csv_row(&self) -> String {
+        format!(
+            "{},{},{},{},{}",
+            self.0["index"].as_u64().unwrap_or(0),
+            self.0["timestamp"].as_str().unwrap_or(""),
+            self.0["temperature_c"].as_f64().unwrap_or(0.0),
+            self.0["humidity_rh"].as_f64().unwrap_or(0.0),
+            self.0["co2_ppm"].as_u64().unwrap_or(0)
+        )
+    }
+
+    fn render_json_value(&self) -> serde_json::Value {
+        self.0.clone()
+    }
 }

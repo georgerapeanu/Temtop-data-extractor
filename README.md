@@ -138,6 +138,19 @@ The top-level CLI currently exposes:
 
 The `c1plus` subcommand contains the sensor-specific operations for the currently supported model.
 
+### Batch collection for vmagent / Loki
+
+Run a single collection cycle that fetches both current measurements and device-local history, writes Prometheus exposition text to stdout, and emits structured JSON logs to stderr.
+
+```bash
+cargo run --release -- c1plus collect \
+  --address A4:C1:38:C2:CC:F2 \
+  --sensor-name living_room \
+  --format prometheus
+```
+
+This output is intended to be piped into a `vmagent` ingestion path such as `import/prometheus`, while the JSON stderr logs are suitable for journald/promtail/Loki.
+
 ### Scan
 
 Scan for nearby Temtop devices and infer GUIDs from names like `C1+_90158797465673526885`.
