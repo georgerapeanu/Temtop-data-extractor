@@ -11,8 +11,6 @@ pub trait CommandOutput: Sync {
 }
 
 pub trait HistoryRecordOutput: Sync {
-    fn render_text_row(&self) -> String;
-    fn render_csv_row(&self) -> String;
     fn render_json_value(&self) -> Value;
 }
 
@@ -55,5 +53,7 @@ pub fn detect_profile(name: Option<&str>) -> Option<&'static dyn SensorProfile> 
 
 /// Resolves a profile by its stable CLI id.
 pub fn profile_by_id(id: &str) -> Option<&'static dyn SensorProfile> {
-    all_profiles().into_iter().find(|profile| profile.id() == id)
+    all_profiles()
+        .into_iter()
+        .find(|profile| profile.id() == id)
 }

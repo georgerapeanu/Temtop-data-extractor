@@ -97,7 +97,10 @@ mod tests {
     #[test]
     fn builds_expected_history_meta_request() {
         let frame = build_request(CMD_GET_HISTORY_META, "90158797465673526885", &[1]).unwrap();
-        assert_eq!(hex_spaced(&frame), "5a a5 0c 87 5a 0f 57 61 2e 38 49 34 44 55 01 31");
+        assert_eq!(
+            hex_spaced(&frame),
+            "5a a5 0c 87 5a 0f 57 61 2e 38 49 34 44 55 01 31"
+        );
     }
 
     #[test]
@@ -107,10 +110,59 @@ mod tests {
             0x01, 0x00, 0x02, 0x00, 0x12, 0x0b, 0x16, 0x6c,
         ];
         let chunk = [
-            0xd5, 0xc8, 0x02, CMD_GET_HISTORY_CHUNK, 0x5a, 0x0f, 0x57, 0x61, 0x2e, 0x38, 0x49,
-            0x34, 0x44, 0x55, 0x20, 0x00, 0x12, 0x07, 0xea, 0x03, 0x1b, 0x15, 0x00, 0x00, 0x00,
-            0x00, 0xe9, 0x01, 0xc0, 0x00, 0x00, 0x03, 0x7e, 0x00, 0x00, 0x07, 0xea, 0x03, 0x1b,
-            0x15, 0x1e, 0x00, 0x00, 0x00, 0xf2, 0x01, 0xb3, 0x00, 0x00, 0x04, 0x67, 0x00, 0x00,
+            0xd5,
+            0xc8,
+            0x02,
+            CMD_GET_HISTORY_CHUNK,
+            0x5a,
+            0x0f,
+            0x57,
+            0x61,
+            0x2e,
+            0x38,
+            0x49,
+            0x34,
+            0x44,
+            0x55,
+            0x20,
+            0x00,
+            0x12,
+            0x07,
+            0xea,
+            0x03,
+            0x1b,
+            0x15,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0xe9,
+            0x01,
+            0xc0,
+            0x00,
+            0x00,
+            0x03,
+            0x7e,
+            0x00,
+            0x00,
+            0x07,
+            0xea,
+            0x03,
+            0x1b,
+            0x15,
+            0x1e,
+            0x00,
+            0x00,
+            0x00,
+            0xf2,
+            0x01,
+            0xb3,
+            0x00,
+            0x00,
+            0x04,
+            0x67,
+            0x00,
+            0x00,
             0xfb,
         ];
 
@@ -121,8 +173,14 @@ mod tests {
     #[test]
     fn rejects_invalid_guids() {
         let cases = [
-            ("001122334455667788gg", "GUID must contain only decimal digits"),
-            ("0011223344556677889", "GUID must contain an even number of digits"),
+            (
+                "001122334455667788gg",
+                "GUID must contain only decimal digits",
+            ),
+            (
+                "0011223344556677889",
+                "GUID must contain an even number of digits",
+            ),
             (
                 "0011223344556677889900",
                 "GUID must decode to exactly 10 bytes (20 digits)",
@@ -131,7 +189,10 @@ mod tests {
 
         for (guid, expected) in cases {
             let err = build_request(CMD_GET_HISTORY_META, guid, &[1]).unwrap_err();
-            assert!(err.to_string().contains(expected), "guid {guid} should mention {expected}");
+            assert!(
+                err.to_string().contains(expected),
+                "guid {guid} should mention {expected}"
+            );
         }
     }
 

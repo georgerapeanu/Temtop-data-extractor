@@ -67,10 +67,7 @@ pub async fn resolve_device(
     target: &TargetFilter,
 ) -> Result<(Peripheral, DiscoveredDevice, &'static dyn SensorProfile)> {
     let deadline = Instant::now() + Duration::from_secs(target.scan_timeout_secs);
-    let requested_profile = target
-        .sensor
-        .as_deref()
-        .and_then(profile_by_id);
+    let requested_profile = target.sensor.as_deref().and_then(profile_by_id);
     adapter.start_scan(ScanFilter::default()).await?;
 
     loop {
@@ -103,11 +100,13 @@ pub async fn resolve_device(
                 .as_ref()
                 .map(|wanted| guid.as_deref() == Some(wanted.as_str()))
                 .unwrap_or(true);
-            let inferred_guid_ok = !target.require_inferred_guid || target.guid.is_some() || guid.is_some();
+            let inferred_guid_ok =
+                !target.require_inferred_guid || target.guid.is_some() || guid.is_some();
 
             if sensor_ok && address_ok && guid_ok && inferred_guid_ok {
                 let _ = adapter.stop_scan().await;
-                let profile = profile.ok_or_else(|| anyhow!("sensor profile could not be resolved"))?;
+                let profile =
+                    profile.ok_or_else(|| anyhow!("sensor profile could not be resolved"))?;
                 return Ok((
                     peripheral,
                     DiscoveredDevice {
@@ -177,8 +176,7 @@ pub async fn wait_for_command(
         if remaining.is_zero() {
             return Err(timeout_error(cmd, &seen_other_cmds));
         }
-        let next = timeout(remaining, notifications.next())
-            .await;
+        let next = timeout(remaining, notifications.next()).await;
         let next = match next {
             Ok(next) => next,
             Err(_) => return Err(timeout_error(cmd, &seen_other_cmds)),
@@ -274,11 +272,9 @@ pub fn format_frame_hex(bytes: &[u8]) -> String {
 }
 
 fn response_matches(frame: &[u8], expected_cmd: u8, expected_guid: &str) -> Result<bool> {
-    Ok(
-        verify_response(frame)
-            && frame.get(3).copied() == Some(expected_cmd)
-            && response_matches_guid(frame, expected_guid)?,
-    )
+    Ok(verify_response(frame)
+        && frame.get(3).copied() == Some(expected_cmd)
+        && response_matches_guid(frame, expected_guid)?)
 }
 
 #[cfg(test)]

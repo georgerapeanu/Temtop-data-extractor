@@ -27,7 +27,7 @@ The CLI already supports the discovery patterns.
 - keep model-specific parsing isolated from shared BLE transport
 
 For `C1+`, `--guid` is usually optional because it can be inferred from
-advertising names like `C1+_90158797465673526885`. You only need to pass
+advertising names like `C1+_00112233445566778899`. You only need to pass
 `--guid` explicitly when the advertisement name is missing or unavailable on the
 local platform.
 
@@ -140,7 +140,7 @@ The `c1plus` subcommand contains the sensor-specific operations for the currentl
 
 ### Scan
 
-Scan for nearby Temtop devices and infer GUIDs from names like `C1+_90158797465673526885`.
+Scan for nearby Temtop devices and infer GUIDs from names like `C1+_00112233445566778899`.
 
 ```bash
 cargo run --release -- scan --seconds 10
@@ -163,7 +163,7 @@ cargo run --release -- scan --seconds 10 --format json
 Resolve a sensor by address or GUID, connect, and print services and characteristics.
 
 ```bash
-cargo run --release -- c1plus inspect --address A4:C1:38:C2:CC:F2
+cargo run --release -- c1plus inspect --address AA:BB:CC:DD:EE:FF
 ```
 
 If a device is known by MAC address but its advertising name is temporarily absent, the CLI still uses the selected sensor profile to connect and inspect it.
@@ -174,7 +174,7 @@ Read device configuration/telemetry currently exposed via the BLE params respons
 
 ```bash
 cargo run --release -- c1plus params \
-  --address A4:C1:38:C2:CC:F2 \
+  --address AA:BB:CC:DD:EE:FF \
   --format json
 ```
 
@@ -195,7 +195,7 @@ Read a single current sample.
 
 ```bash
 cargo run --release -- c1plus current \
-  --address A4:C1:38:C2:CC:F2 \
+  --address AA:BB:CC:DD:EE:FF \
   --format json
 ```
 
@@ -216,7 +216,7 @@ Subscribe to live notifications and optionally poll current data periodically.
 
 ```bash
 cargo run --release -- c1plus live \
-  --address A4:C1:38:C2:CC:F2 \
+  --address AA:BB:CC:DD:EE:FF \
   --poll-secs 10 \
   --format jsonl
 ```
@@ -232,7 +232,7 @@ Fetch device-local history and print it to stdout.
 
 ```bash
 cargo run --release -- c1plus history \
-  --address A4:C1:38:C2:CC:F2 \
+  --address AA:BB:CC:DD:EE:FF \
   --format csv
 ```
 
@@ -242,6 +242,16 @@ Supported history formats:
 - `json`: one JSON object containing session metadata and all records
 - `jsonl`: one JSON object per history record
 - `csv`: CSV rows written to stdout
+- `prometheus`: Prometheus exposition text for historical sensor data plus `temtop_sensor_historical_*` telemetry metrics
+
+Example:
+
+```bash
+cargo run --release -- c1plus history \
+  --address AA:BB:CC:DD:EE:FF \
+  --sensor-name office_sensor \
+  --format prometheus
+```
 
 ## Current reverse-engineering boundary
 
@@ -312,6 +322,8 @@ nix develop --command cargo test --all-targets
 
 GitHub Actions also runs the test suite and builds the binary artifact on pushes and pull requests.
 
+Tag pushes like `v0.1.0` also publish the Linux binary to a GitHub release so the build is visible under Releases instead of only ephemeral workflow artifacts.
+
 3. Fetch local history:
 
 ```bash
@@ -325,3 +337,5 @@ cargo run --release -- live --address <mac> --poll-secs 30 --format jsonl
 ```
 
 That `live --format jsonl` path is the most likely future bridge into `vmagent` or a small local exporter.
+
+`live` also supports `--format prometheus`, which emits `temtop_sensor_live_*` metrics for each live sample together with live telemetry such as success, duration, event count, and error count. Structured JSON logs are written to stderr for Loki/journald ingestion.

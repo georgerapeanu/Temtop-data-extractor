@@ -92,11 +92,19 @@ impl C1PlusProfile {
             tvoc_ppb: u16::from_be_bytes(frame[32..34].try_into().unwrap()),
             battery: frame[34],
             temperature_unit: Self::unit_string(frame[35]).to_string(),
-            alarm_mode: if frame.len() > 39 { Some(frame[39]) } else { None },
+            alarm_mode: if frame.len() > 39 {
+                Some(frame[39])
+            } else {
+                None
+            },
         }))
     }
 
-    pub fn parse_history_record(&self, record: &[u8], index: usize) -> Result<Box<dyn HistoryRecordOutput>> {
+    pub fn parse_history_record(
+        &self,
+        record: &[u8],
+        index: usize,
+    ) -> Result<Box<dyn HistoryRecordOutput>> {
         if record.len() < 16 {
             bail!("record too short");
         }
@@ -220,20 +228,6 @@ struct C1PlusHistoryRecord {
 }
 
 impl HistoryRecordOutput for C1PlusHistoryRecord {
-    fn render_text_row(&self) -> String {
-        format!(
-            "{}\t{}\t{:.1}\t{:.1}\t{}",
-            self.index, self.timestamp, self.temperature_c, self.humidity_rh, self.co2_ppm
-        )
-    }
-
-    fn render_csv_row(&self) -> String {
-        format!(
-            "{},{},{:.1},{:.1},{}",
-            self.index, self.timestamp, self.temperature_c, self.humidity_rh, self.co2_ppm
-        )
-    }
-
     fn render_json_value(&self) -> serde_json::Value {
         json!(self)
     }
@@ -280,7 +274,10 @@ mod tests {
 
     fn assert_json_float(json: &serde_json::Value, key: &str, expected: f64) {
         let actual = json[key].as_f64().unwrap();
-        assert!((actual - expected).abs() < 0.001, "{key}: expected {expected}, got {actual}");
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "{key}: expected {expected}, got {actual}"
+        );
     }
 
     #[test]
@@ -376,7 +373,5 @@ mod tests {
         assert_json_float(&json, "temperature_c", 24.2);
         assert_json_float(&json, "humidity_rh", 43.5);
         assert_eq!(json["co2_ppm"], 1127);
-        let csv_line = parsed.render_csv_row();
-        assert_eq!(csv_line, "2,2026-03-27 21:30:00,24.2,43.5,1127");
     }
 }
