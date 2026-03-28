@@ -1,11 +1,11 @@
-name: ci
+name: test
 
 on:
   push:
   pull_request:
 
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,17 +16,3 @@ jobs:
 
       - name: Run tests
         run: nix develop --command cargo test --all-targets
-
-      - name: Build package
-        run: nix build .#default
-
-      - name: Stage binary artifact
-        run: |
-          mkdir -p dist
-          cp result/bin/temtop-sensor dist/temtop-sensor
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: temtop-sensor-${{ github.sha }}
-          path: dist/temtop-sensor

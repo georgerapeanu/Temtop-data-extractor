@@ -21,7 +21,7 @@ jobs:
       - name: Build package
         run: nix build .#default
 
-      - name: Stage release asset
+      - name: Stage packaged binary
         run: |
           mkdir -p dist
           cp result/bin/temtop-sensor dist/temtop-sensor-linux-amd64
