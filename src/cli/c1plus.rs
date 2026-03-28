@@ -151,6 +151,9 @@ fn parse_history_meta(meta: &[u8]) -> Result<(u16, u16)> {
         bail!("history meta frame too short: {}", meta.len());
     }
     let ready = meta[14];
+    if ready == 0x00 {
+        return Ok((0, 0));
+    }
     if ready != 0x01 {
         bail!("history meta not ready: status=0x{ready:02x}");
     }
@@ -916,4 +919,21 @@ async fn live(cmd: C1PlusLiveCmd) -> Result<()> {
         Ok(())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_history_meta;
+
+    #[test]
+    fn treats_not_ready_history_meta_as_empty_history() {
+        let frame = [
+            0xd5, 0xc8, 0x12, 0x87, 0x5a, 0x0f, 0x57, 0x61, 0x2e, 0x38, 0x49, 0x34, 0x44, 0x55,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let (total_count, record_len) = parse_history_meta(&frame).unwrap();
+        assert_eq!(total_count, 0);
+        assert_eq!(record_len, 0);
+    }
 }
