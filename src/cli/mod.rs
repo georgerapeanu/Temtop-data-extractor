@@ -58,10 +58,16 @@ pub struct ScanCmd {
 
 #[derive(Args, Debug, Clone)]
 pub struct TargetArgs {
-    #[arg(long, help = "BLE MAC address. Optional if the target can be found by GUID or profile scan.")]
+    #[arg(
+        long,
+        help = "BLE MAC address. Optional if the target can be found by GUID or profile scan."
+    )]
     pub address: Option<String>,
 
-    #[arg(long, help = "Device GUID. Optional when it can be inferred from the advertisement name, such as C1+_<guid>.")]
+    #[arg(
+        long,
+        help = "Device GUID. Optional when it can be inferred from the advertisement name, such as C1+_<guid>."
+    )]
     pub guid: Option<String>,
 
     #[arg(long, default_value_t = 15)]
@@ -108,6 +114,8 @@ pub fn resolved_guid(target: &TargetArgs, discovered_guid: Option<String>) -> Re
 
 pub struct ConnectedTarget {
     pub peripheral: Peripheral,
+    pub address: String,
+    pub name: Option<String>,
     pub guid: String,
     pub write_char: Characteristic,
     pub notify_char: Characteristic,
@@ -123,6 +131,8 @@ pub async fn connect_target(target: &TargetArgs, sensor: &str) -> Result<Connect
 
     Ok(ConnectedTarget {
         peripheral,
+        address: discovered.address,
+        name: discovered.name,
         guid,
         write_char,
         notify_char,

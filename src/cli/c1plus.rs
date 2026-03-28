@@ -1,24 +1,36 @@
 use anyhow::{anyhow, bail, Result};
+use axum::{
+    extract::State,
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use btleplug::api::Peripheral as _;
 use clap::{Args, Subcommand};
 use futures::StreamExt;
 use serde::Serialize;
 use std::future::Future;
 use std::io::{self, Write};
-use tokio::time::{interval, Duration};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tokio::time::{interval, sleep, Duration};
 
 use crate::ble::{
     disable_all_notifications, drain_notifications, first_adapter, format_frame_hex, request_once,
     resolve_device, wait_for_command,
 };
+use crate::output::prometheus::{self, Labels, Snapshot, Telemetry};
 use crate::protocol::build_request;
 use crate::sensor::c1_plus::C1_PLUS;
 use crate::sensor::SensorProfile;
 use serde_json::json;
 
 use super::{
-    connect_target, print_json, print_jsonl, target_filter, HistoryFormat, OutputFormat, StreamFormat,
-    TargetArgs,
+    connect_target, print_json, print_jsonl, target_filter, HistoryFormat, OutputFormat,
+    StreamFormat, TargetArgs,
 };
 
 #[derive(Args, Debug)]
@@ -34,6 +46,7 @@ pub enum C1PlusCommand {
     Current(C1PlusOutputCmd),
     History(C1PlusHistoryCmd),
     Live(C1PlusLiveCmd),
+    Serve(C1PlusServeCmd),
 }
 
 #[derive(Args, Debug)]
@@ -78,6 +91,21 @@ pub struct C1PlusLiveCmd {
     pub limit: Option<usize>,
 }
 
+#[derive(Args, Debug, Clone)]
+pub struct C1PlusServeCmd {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    #[arg(long, help = "Human-friendly sensor name used in Prometheus labels.")]
+    pub name: Option<String>,
+
+    #[arg(long, default_value = "127.0.0.1:9880")]
+    pub listen: String,
+
+    #[arg(long, default_value_t = 60)]
+    pub poll_secs: u64,
+}
+
 pub async fn run(cli: C1PlusCli) -> Result<()> {
     match cli.command {
         C1PlusCommand::Inspect(cmd) => inspect(cmd).await,
@@ -85,10 +113,29 @@ pub async fn run(cli: C1PlusCli) -> Result<()> {
         C1PlusCommand::Current(cmd) => current(cmd).await,
         C1PlusCommand::History(cmd) => history(cmd).await,
         C1PlusCommand::Live(cmd) => live(cmd).await,
+        C1PlusCommand::Serve(cmd) => serve(cmd).await,
     }
 }
 
-async fn disconnect_on_sigint<T, F>(peripheral: &btleplug::platform::Peripheral, future: F) -> Result<T>
+#[derive(Clone, Default)]
+struct ExporterState {
+    metrics: String,
+    telemetry: Telemetry,
+    last_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct CurrentSnapshot {
+    address: String,
+    discovered_name: Option<String>,
+    guid: String,
+    sample: serde_json::Value,
+}
+
+async fn disconnect_on_sigint<T, F>(
+    peripheral: &btleplug::platform::Peripheral,
+    future: F,
+) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
@@ -135,7 +182,10 @@ fn parse_history_meta(meta: &[u8]) -> Result<(u16, u16)> {
     Ok((total_count, record_len))
 }
 
-fn print_command_output(format: OutputFormat, output: &dyn crate::sensor::CommandOutput) -> Result<()> {
+fn print_command_output(
+    format: OutputFormat,
+    output: &dyn crate::sensor::CommandOutput,
+) -> Result<()> {
     match format {
         OutputFormat::Json => print_json(&output.render_json_value())?,
         OutputFormat::Csv => {
@@ -182,7 +232,10 @@ fn print_history_output(
             }
         }
         HistoryFormat::Json => {
-            let records_json: Vec<_> = records.iter().map(|record| record.render_json_value()).collect();
+            let records_json: Vec<_> = records
+                .iter()
+                .map(|record| record.render_json_value())
+                .collect();
             print_json(&json!({
                 "session": session_json,
                 "records": records_json,
@@ -325,6 +378,34 @@ async fn current(cmd: C1PlusOutputCmd) -> Result<()> {
     .await
 }
 
+async fn fetch_current_snapshot(target: &TargetArgs) -> Result<CurrentSnapshot> {
+    let connected = connect_target(target, C1_PLUS.id()).await?;
+    with_disconnect(&connected.peripheral, async {
+        let response = disconnect_on_sigint(
+            &connected.peripheral,
+            request_once(
+                &connected.peripheral,
+                &connected.write_char,
+                &connected.notify_char,
+                &build_request(C1_PLUS.cmd_get_current(), &connected.guid, &[])?,
+                C1_PLUS.cmd_get_current(),
+                &connected.guid,
+                target.timeout_secs,
+                target.verbose,
+            ),
+        )
+        .await?;
+        let sample = C1_PLUS.parse_current(&response)?.render_json_value();
+        Ok(CurrentSnapshot {
+            address: connected.address,
+            discovered_name: connected.name,
+            guid: connected.guid,
+            sample,
+        })
+    })
+    .await
+}
+
 async fn history(cmd: C1PlusHistoryCmd) -> Result<()> {
     let connected = connect_target(&cmd.target, C1_PLUS.id()).await?;
     with_disconnect(&connected.peripheral, async {
@@ -338,7 +419,13 @@ async fn history(cmd: C1PlusHistoryCmd) -> Result<()> {
             }
 
             let meta_req = build_request(C1_PLUS.cmd_get_history_meta(), &connected.guid, &[1])?;
-            write_request(peripheral, &connected.write_char, &meta_req, cmd.target.verbose).await?;
+            write_request(
+                peripheral,
+                &connected.write_char,
+                &meta_req,
+                cmd.target.verbose,
+            )
+            .await?;
             let meta = wait_for_command(
                 &mut notifications,
                 C1_PLUS.cmd_get_history_meta(),
@@ -359,8 +446,15 @@ async fn history(cmd: C1PlusHistoryCmd) -> Result<()> {
             let mut records = Vec::new();
             let mut retries_left = 3i32;
             while records.len() < total_count as usize {
-                let chunk_req = build_request(C1_PLUS.cmd_get_history_chunk(), &connected.guid, &[1])?;
-                write_request(peripheral, &connected.write_char, &chunk_req, cmd.target.verbose).await?;
+                let chunk_req =
+                    build_request(C1_PLUS.cmd_get_history_chunk(), &connected.guid, &[1])?;
+                write_request(
+                    peripheral,
+                    &connected.write_char,
+                    &chunk_req,
+                    cmd.target.verbose,
+                )
+                .await?;
 
                 let chunk = match wait_for_command(
                     &mut notifications,
@@ -427,7 +521,10 @@ async fn live(cmd: C1PlusLiveCmd) -> Result<()> {
     let connected = connect_target(&cmd.target, C1_PLUS.id()).await?;
     with_disconnect(&connected.peripheral, async {
         let mut notifications = connected.peripheral.notifications().await?;
-        connected.peripheral.subscribe(&connected.notify_char).await?;
+        connected
+            .peripheral
+            .subscribe(&connected.notify_char)
+            .await?;
 
         if cmd.poll_secs > 0 {
             let initial = build_request(C1_PLUS.cmd_get_current(), &connected.guid, &[])?;
@@ -512,4 +609,156 @@ async fn live(cmd: C1PlusLiveCmd) -> Result<()> {
         Ok(())
     })
     .await
+}
+
+async fn serve(cmd: C1PlusServeCmd) -> Result<()> {
+    let listen: SocketAddr = cmd.listen.parse()?;
+    let state = Arc::new(RwLock::new(ExporterState::default()));
+
+    let collector_state = Arc::clone(&state);
+    let collector_cmd = cmd.clone();
+    tokio::spawn(async move {
+        run_exporter_loop(collector_cmd, collector_state).await;
+    });
+
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(health_handler))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "event": "exporter_started",
+            "sensor": C1_PLUS.id(),
+            "listen": listen.to_string(),
+            "poll_secs": cmd.poll_secs,
+        }))?
+    );
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn run_exporter_loop(cmd: C1PlusServeCmd, state: Arc<RwLock<ExporterState>>) {
+    let poll_secs = cmd.poll_secs.max(5);
+    loop {
+        let started = Instant::now();
+        let now = unix_time_now();
+        match fetch_current_snapshot(&cmd.target).await {
+            Ok(snapshot) => {
+                let labels = Labels {
+                    mac: snapshot.address.clone(),
+                    guid: snapshot.guid.clone(),
+                    sensor: C1_PLUS.id().to_string(),
+                    sensor_name: cmd
+                        .name
+                        .clone()
+                        .or(snapshot.discovered_name.clone())
+                        .unwrap_or_else(|| snapshot.guid.clone()),
+                };
+                let mut guard = state.write().await;
+                guard.telemetry.collector_up = true;
+                guard.telemetry.success_total += 1;
+                guard.telemetry.last_success_unixtime = Some(now);
+                guard.telemetry.last_collection_duration_seconds =
+                    Some(started.elapsed().as_secs_f64());
+                guard.metrics = prometheus::render_metrics(&Snapshot {
+                    labels,
+                    sample: Some(snapshot.sample.clone()),
+                    telemetry: guard.telemetry.clone(),
+                });
+                guard.last_error = None;
+
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "event": "collector_success",
+                        "sensor": C1_PLUS.id(),
+                        "address": snapshot.address,
+                        "guid": snapshot.guid,
+                        "duration_seconds": guard.telemetry.last_collection_duration_seconds,
+                    }))
+                    .unwrap_or_else(|_| "{\"event\":\"collector_success\"}".to_string())
+                );
+            }
+            Err(err) => {
+                let mut guard = state.write().await;
+                guard.telemetry.collector_up = false;
+                guard.telemetry.failure_total += 1;
+                guard.telemetry.last_failure_unixtime = Some(now);
+                guard.telemetry.last_collection_duration_seconds =
+                    Some(started.elapsed().as_secs_f64());
+                guard.last_error = Some(err.to_string());
+                let labels = Labels {
+                    mac: cmd.target.address.clone().unwrap_or_default(),
+                    guid: cmd.target.guid.clone().unwrap_or_default(),
+                    sensor: C1_PLUS.id().to_string(),
+                    sensor_name: cmd.name.clone().unwrap_or_else(|| "unknown".to_string()),
+                };
+                guard.metrics = prometheus::render_metrics(&Snapshot {
+                    labels,
+                    sample: None,
+                    telemetry: guard.telemetry.clone(),
+                });
+
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "event": "collector_failure",
+                        "sensor": C1_PLUS.id(),
+                        "error": guard.last_error,
+                        "duration_seconds": guard.telemetry.last_collection_duration_seconds,
+                    }))
+                    .unwrap_or_else(|_| "{\"event\":\"collector_failure\"}".to_string())
+                );
+            }
+        }
+
+        sleep(Duration::from_secs(poll_secs)).await;
+    }
+}
+
+async fn metrics_handler(State(state): State<Arc<RwLock<ExporterState>>>) -> Response {
+    let body = state.read().await.metrics.clone();
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
+async fn health_handler(State(state): State<Arc<RwLock<ExporterState>>>) -> Response {
+    let guard = state.read().await;
+    let status = if guard.telemetry.collector_up {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        serde_json::to_string(&json!({
+            "ok": guard.telemetry.collector_up,
+            "last_error": guard.last_error,
+            "success_total": guard.telemetry.success_total,
+            "failure_total": guard.telemetry.failure_total,
+        }))
+        .unwrap_or_else(|_| "{\"ok\":false}".to_string()),
+    )
+        .into_response()
+}
+
+fn unix_time_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

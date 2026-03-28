@@ -92,11 +92,19 @@ impl C1PlusProfile {
             tvoc_ppb: u16::from_be_bytes(frame[32..34].try_into().unwrap()),
             battery: frame[34],
             temperature_unit: Self::unit_string(frame[35]).to_string(),
-            alarm_mode: if frame.len() > 39 { Some(frame[39]) } else { None },
+            alarm_mode: if frame.len() > 39 {
+                Some(frame[39])
+            } else {
+                None
+            },
         }))
     }
 
-    pub fn parse_history_record(&self, record: &[u8], index: usize) -> Result<Box<dyn HistoryRecordOutput>> {
+    pub fn parse_history_record(
+        &self,
+        record: &[u8],
+        index: usize,
+    ) -> Result<Box<dyn HistoryRecordOutput>> {
         if record.len() < 16 {
             bail!("record too short");
         }
@@ -280,7 +288,10 @@ mod tests {
 
     fn assert_json_float(json: &serde_json::Value, key: &str, expected: f64) {
         let actual = json[key].as_f64().unwrap();
-        assert!((actual - expected).abs() < 0.001, "{key}: expected {expected}, got {actual}");
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "{key}: expected {expected}, got {actual}"
+        );
     }
 
     #[test]

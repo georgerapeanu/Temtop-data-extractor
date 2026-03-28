@@ -11,7 +11,10 @@ pub async fn run(cmd: ScanCmd) -> Result<()> {
     let devices: Vec<_> = if cmd.show_all {
         devices
     } else {
-        devices.into_iter().filter(|dev| dev.sensor.is_some()).collect()
+        devices
+            .into_iter()
+            .filter(|dev| dev.sensor.is_some())
+            .collect()
     };
 
     if cmd.format == OutputFormat::Json {
