@@ -1,6 +1,5 @@
 mod ble;
 mod cli;
-mod output;
 mod protocol;
 mod sensor;
 

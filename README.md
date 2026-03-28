@@ -138,26 +138,6 @@ The top-level CLI currently exposes:
 
 The `c1plus` subcommand contains the sensor-specific operations for the currently supported model.
 
-### Prometheus exporter
-
-Run a small HTTP exporter that polls the sensor and serves Prometheus metrics on `/metrics`.
-
-```bash
-cargo run --release -- c1plus serve \
-  --address A4:C1:38:C2:CC:F2 \
-  --name living_room \
-  --listen 127.0.0.1:9880 \
-  --poll-secs 60
-```
-
-This exposes:
-
-- current sensor readings such as PM2.5, temperature, humidity, CO2, TVOC, AQI, and battery
-- exporter telemetry such as success/failure counts and last collection timestamps
-- labels for `mac`, `guid`, `sensor`, and `sensor_name`
-
-Health is available on `/healthz`.
-
 ### Scan
 
 Scan for nearby Temtop devices and infer GUIDs from names like `C1+_90158797465673526885`.
