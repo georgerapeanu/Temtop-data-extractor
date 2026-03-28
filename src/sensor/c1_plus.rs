@@ -228,13 +228,6 @@ struct C1PlusHistoryRecord {
 }
 
 impl HistoryRecordOutput for C1PlusHistoryRecord {
-    fn render_text_row(&self) -> String {
-        format!(
-            "{}\t{}\t{:.1}\t{:.1}\t{}",
-            self.index, self.timestamp, self.temperature_c, self.humidity_rh, self.co2_ppm
-        )
-    }
-
     fn render_csv_row(&self) -> String {
         format!(
             "{},{},{:.1},{:.1},{}",
